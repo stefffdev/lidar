@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# downloaded terrain data (recreate with fetch_dem.py)
+/data/

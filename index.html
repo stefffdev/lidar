@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lidar viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #fff; overflow: hidden;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  .box { position: absolute; background: rgba(40, 42, 48, .78); border-radius: 8px; padding: 6px 12px;
+    backdrop-filter: blur(6px); }
+  #title { top: 14px; left: 14px; font-size: 16px; font-weight: 600; }
+  #panel { top: 14px; right: 14px; width: 220px; padding: 10px 12px; }
+  #panel label { display: block; margin-bottom: 8px; }
+  #panel label span { float: right; opacity: .7; font-variant-numeric: tabular-nums; }
+  #panel input[type=range], #panel select { width: 100%; margin: 2px 0 0; }
+  #panel button { width: 100%; }
+  #scale { bottom: 18px; left: 14px; background: none; padding: 0; font-weight: 600;
+    text-shadow: 0 0 4px #000; text-align: center; }
+  #scale i { display: block; height: 4px; background: #fff; border-radius: 2px; margin-top: 3px;
+    box-shadow: 0 0 4px #000; }
+  #info { bottom: 14px; right: 14px; font-size: 12px; text-align: right; }
+  #home { position: absolute; width: 12px; height: 12px; margin: -8px 0 0 -8px; border-radius: 50%;
+    border: 2px solid #fff; background: #e5484d; box-shadow: 0 0 6px #000; pointer-events: none; }
+  #status { top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 15px; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="home" hidden title="Home"></div>
+<div id="title" class="box">Lidar: bare ground</div>
+<div id="panel" class="box">
+  <label>Colour by
+    <select id="mode">
+      <option value="0">Local relief (bumps &amp; hollows)</option>
+      <option value="1">Absolute height</option>
+    </select>
+  </label>
+  <label>Relief radius <span id="radiusV"></span>
+    <input id="radius" type="range" min="3" max="150" value="25"></label>
+  <label>Colour contrast <span id="contrastV"></span>
+    <input id="contrast" type="range" min="0.2" max="4" step="0.1" value="1"></label>
+  <label>Shading strength <span id="exagV"></span>
+    <input id="exag" type="range" min="0" max="8" step="0.25" value="2.5"></label>
+  <label>Sun direction <span id="azV"></span>
+    <input id="az" type="range" min="0" max="360" step="5" value="315"></label>
+  <button id="reset">Centre on home</button>
+</div>
+<div id="scale" class="box"><span></span><i></i></div>
+<div id="info" class="box"></div>
+<div id="status" class="box">Loading terrain…</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const canvas = $('gl');
+const gl = canvas.getContext('webgl2', { antialias: false });
+const status = msg => { $('status').hidden = !msg; if (msg) $('status').textContent = msg; };
+if (!gl) status('This browser does not support WebGL 2.');
+
+const VS = `#version 300 es
+in vec2 p; void main() { gl_Position = vec4(p, 0., 1.); }`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uDem, uLrm;
+uniform vec2 uSize, uView, uCenter;   // raster size, canvas size, raster coord at canvas centre
+uniform float uZoom, uCell;           // canvas px per raster px, metres per raster px
+uniform float uRange, uMid, uHalf, uExag, uAz;
+uniform int uMode;
+out vec4 o;
+
+vec3 ramp(float t) {                  // teal (low) - cream - rust (high)
+  const vec3 c[7] = vec3[7](
+    vec3(.02,.20,.27), vec3(.10,.45,.53), vec3(.50,.76,.79), vec3(.96,.94,.90),
+    vec3(.95,.68,.42), vec3(.80,.36,.14), vec3(.42,.12,.03));
+  t = clamp(t * .5 + .5, 0., 1.) * 6.;
+  int i = int(min(floor(t), 5.));
+  return mix(c[i], c[i + 1], t - float(i));
+}
+
+void main() {
+  vec2 s = vec2(gl_FragCoord.x, uView.y - gl_FragCoord.y);
+  vec2 t = uCenter + (s - uView * .5) / uZoom;
+  if (t.x < 0. || t.y < 0. || t.x > uSize.x || t.y > uSize.y) { o = vec4(.043,.051,.071,1.); return; }
+  vec2 uv = t / uSize;
+  float d = max(1., 1. / uZoom);      // sample spacing follows the zoom level
+  vec2 dx = vec2(d, 0.) / uSize, dy = vec2(0., d) / uSize;
+  float gx = (texture(uDem, uv + dx).r - texture(uDem, uv - dx).r) / (2. * d * uCell);
+  float gn = (texture(uDem, uv - dy).r - texture(uDem, uv + dy).r) / (2. * d * uCell);
+  vec3 n = normalize(vec3(-gx * uExag, -gn * uExag, 1.));
+  vec3 l = vec3(sin(uAz) * .7071, cos(uAz) * .7071, .7071);
+  float shade = max(dot(n, l), 0.) / .7071;   // 1 on flat ground
+  float v = uMode == 0 ? texture(uLrm, uv).r / uRange : (texture(uDem, uv).r - uMid) / uHalf;
+  o = vec4(ramp(v) * clamp(.25 + .75 * shade, 0., 1.35), 1.);
+}`;
+
+function program() {
+  const prog = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, FS]]) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    gl.attachShader(prog, sh);
+  }
+  gl.linkProgram(prog); gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const u = {};
+  for (const n of ['uDem', 'uLrm', 'uSize', 'uView', 'uCenter', 'uZoom', 'uCell', 'uRange', 'uMid',
+    'uHalf', 'uExag', 'uAz', 'uMode']) u[n] = gl.getUniformLocation(prog, n);
+  return u;
+}
+
+// Smooth filtering of float textures needs two (near universal) extensions.
+const smooth = gl && gl.getExtension('OES_texture_float_linear') && gl.getExtension('EXT_color_buffer_float');
+function floatTexture(unit, tex, data, w, h) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  tex = tex || gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, smooth ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, smooth ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST);
+  if (smooth) gl.generateMipmap(gl.TEXTURE_2D);
+  return tex;
+}
+
+// One box-blur pass (horizontal + vertical) with clamped edges, O(pixels).
+function boxBlur(src, dst, tmp, w, h, r) {
+  const k = 1 / (2 * r + 1);
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    let acc = 0;
+    for (let i = -r; i <= r; i++) acc += src[o + Math.min(w - 1, Math.max(0, i))];
+    for (let x = 0; x < w; x++) {
+      tmp[o + x] = acc * k;
+      acc += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+    }
+  }
+  const col = new Float64Array(w);
+  for (let i = -r; i <= r; i++) {
+    const o = Math.min(h - 1, Math.max(0, i)) * w;
+    for (let x = 0; x < w; x++) col[x] += tmp[o + x];
+  }
+  for (let y = 0; y < h; y++) {
+    const o = y * w, add = Math.min(h - 1, y + r + 1) * w, sub = Math.max(0, y - r) * w;
+    for (let x = 0; x < w; x++) {
+      dst[o + x] = col[x] * k;
+      col[x] += tmp[add + x] - tmp[sub + x];
+    }
+  }
+}
+
+let meta, dem, lrm, bufA, bufB, lrmTex, u, lrmP98 = 1, zLo = 0, zHi = 1;
+const view = { cx: 0, cy: 0, zoom: 1 };   // zoom in CSS px per raster px
+
+// Local relief = height minus a smoothed copy of itself (3 box blurs ~ Gaussian).
+function computeRelief() {
+  const { width: w, height: h } = meta, r = Math.max(1, Math.round(+$('radius').value / meta.cell / 2));
+  boxBlur(dem, bufA, bufB, w, h, r);
+  boxBlur(bufA, lrm, bufB, w, h, r);
+  boxBlur(lrm, bufA, bufB, w, h, r);
+  const sample = [];
+  const step = Math.max(1, Math.floor(dem.length / 200000));
+  for (let i = 0; i < dem.length; i++) lrm[i] = dem[i] - bufA[i];
+  for (let i = 0; i < dem.length; i += step) sample.push(Math.abs(lrm[i]));
+  sample.sort((a, b) => a - b);
+  lrmP98 = sample[Math.floor(sample.length * .98)] || 1;
+  lrmTex = floatTexture(1, lrmTex, lrm, w, h);
+}
+
+function draw() {
+  const dpr = devicePixelRatio || 1;
+  const cw = Math.round(canvas.clientWidth * dpr), ch = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+  gl.viewport(0, 0, cw, ch);
+  const contrast = +$('contrast').value;
+  gl.uniform1i(u.uDem, 0); gl.uniform1i(u.uLrm, 1);
+  gl.uniform2f(u.uSize, meta.width, meta.height);
+  gl.uniform2f(u.uView, cw, ch);
+  gl.uniform2f(u.uCenter, view.cx, view.cy);
+  gl.uniform1f(u.uZoom, view.zoom * dpr);
+  gl.uniform1f(u.uCell, meta.cell);
+  gl.uniform1f(u.uRange, lrmP98 / contrast);
+  gl.uniform1f(u.uMid, (zLo + zHi) / 2);
+  gl.uniform1f(u.uHalf, (zHi - zLo) / 2 / contrast);
+  gl.uniform1f(u.uExag, +$('exag').value);
+  gl.uniform1f(u.uAz, +$('az').value * Math.PI / 180);
+  gl.uniform1i(u.uMode, +$('mode').value);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // overlays
+  const [hx, hy] = toScreen(meta.home.col, meta.home.row);
+  $('home').hidden = false;
+  $('home').style.left = hx + 'px'; $('home').style.top = hy + 'px';
+  const target = 120 / view.zoom * meta.cell;                 // metres in ~120 px
+  const pow = 10 ** Math.floor(Math.log10(target));
+  const len = [5, 2, 1].map(m => m * pow).find(m => m <= target);
+  $('scale').firstChild.textContent = len >= 1000 ? len / 1000 + ' km' : len + ' m';
+  $('scale').style.width = len / meta.cell * view.zoom + 'px';
+  $('radiusV').textContent = $('radius').value + ' m';
+  $('contrastV').textContent = '×' + (+$('contrast').value).toFixed(1);
+  $('exagV').textContent = '×' + $('exag').value;
+  $('azV').textContent = $('az').value + '°';
+}
+let queued = false;
+const redraw = () => { if (!queued) { queued = true; requestAnimationFrame(() => { queued = false; draw(); }); } };
+
+const toScreen = (col, row) => [
+  canvas.clientWidth / 2 + (col - view.cx) * view.zoom,
+  canvas.clientHeight / 2 + (row - view.cy) * view.zoom];
+const toRaster = (x, y) => [
+  view.cx + (x - canvas.clientWidth / 2) / view.zoom,
+  view.cy + (y - canvas.clientHeight / 2) / view.zoom];
+
+function goHome() {
+  view.cx = meta.home.col; view.cy = meta.home.row;
+  view.zoom = Math.min(canvas.clientWidth, canvas.clientHeight) / 1500;   // ~1.5 km across
+  redraw();
+}
+
+function zoomAt(x, y, factor) {
+  const [rx, ry] = toRaster(x, y);
+  const min = Math.min(canvas.clientWidth / meta.width, canvas.clientHeight / meta.height) * .5;
+  view.zoom = Math.min(24, Math.max(min, view.zoom * factor));
+  view.cx = rx - (x - canvas.clientWidth / 2) / view.zoom;
+  view.cy = ry - (y - canvas.clientHeight / 2) / view.zoom;
+  redraw();
+}
+
+// pan with one pointer, pinch-zoom with two
+const pointers = new Map();
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  canvas.classList.add('drag');
+});
+canvas.addEventListener('pointermove', e => {
+  if (meta) hover(e.clientX, e.clientY);
+  const prev = pointers.get(e.pointerId);
+  if (!prev) return;
+  if (pointers.size === 1) {
+    view.cx -= (e.clientX - prev[0]) / view.zoom; view.cy -= (e.clientY - prev[1]) / view.zoom;
+  } else if (pointers.size === 2) {
+    const other = [...pointers].find(([id]) => id !== e.pointerId)[1];
+    const before = Math.hypot(prev[0] - other[0], prev[1] - other[1]);
+    const after = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
+    if (before > 0) zoomAt((e.clientX + other[0]) / 2, (e.clientY + other[1]) / 2, after / before);
+  }
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  redraw();
+});
+for (const ev of ['pointerup', 'pointercancel']) canvas.addEventListener(ev, e => {
+  pointers.delete(e.pointerId); if (!pointers.size) canvas.classList.remove('drag');
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.ctrlKey ? .01 : .0015)));
+}, { passive: false });
+
+function hover(x, y) {
+  const [c, r] = toRaster(x, y).map(Math.floor);
+  const inside = c >= 0 && r >= 0 && c < meta.width && r < meta.height;
+  const dist = Math.hypot(c - meta.home.col, r - meta.home.row) * meta.cell;
+  $('info').innerHTML = (inside
+    ? `${dem[r * meta.width + c].toFixed(1)} m a.s.l. · ${dist < 1000 ? dist.toFixed(0) + ' m' : (dist / 1000).toFixed(2) + ' km'} from home<br>`
+    : '') + `Data: ${meta.attribution}`;
+}
+
+for (const id of ['mode', 'contrast', 'exag', 'az']) $(id).addEventListener('input', redraw);
+$('radius').addEventListener('input', () => { $('radiusV').textContent = $('radius').value + ' m'; });
+$('radius').addEventListener('change', () => {
+  status('Recomputing relief…');
+  setTimeout(() => { computeRelief(); status(''); redraw(); }, 30);
+});
+$('reset').addEventListener('click', goHome);
+addEventListener('resize', redraw);
+
+(async function init() {
+  if (!gl) return;
+  try {
+    const [m, raw] = await Promise.all([
+      fetch('data/meta.json').then(r => { if (!r.ok) throw new Error('missing'); return r.json(); }),
+      fetch('data/dem.u16').then(r => { if (!r.ok) throw new Error('missing'); return r.arrayBuffer(); }),
+    ]);
+    meta = m;
+    const packed = new Uint16Array(raw);
+    dem = new Float32Array(packed.length);
+    let lo = 65535, hi = 0;
+    for (let i = 0; i < packed.length; i++) {
+      const v = packed[i]; if (v < lo) lo = v; if (v > hi) hi = v;
+      dem[i] = v * meta.scale;                                  // metres above the lowest point
+    }
+    zLo = lo * meta.scale; zHi = hi * meta.scale;
+    lrm = new Float32Array(dem.length); bufA = new Float32Array(dem.length); bufB = new Float32Array(dem.length);
+    u = program();
+    floatTexture(0, null, dem, meta.width, meta.height);
+    computeRelief();
+    for (let i = 0; i < dem.length; i++) dem[i] += meta.offset;  // real heights for the readout
+    $('title').textContent = `Lidar: bare ground, ${meta.year}`;
+    $('info').textContent = `Data: ${meta.attribution}`;
+    status('');
+    goHome();
+  } catch (err) {
+    console.error(err);
+    status(err.message === 'missing'
+      ? 'No terrain data yet – run: .venv/bin/python fetch_dem.py'
+      : 'Could not start: ' + err.message);
+  }
+})();
+</script>
+</body>
+</html>
